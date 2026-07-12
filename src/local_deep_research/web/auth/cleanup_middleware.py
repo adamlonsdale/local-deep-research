@@ -9,7 +9,8 @@ from flask import session
 from loguru import logger
 from sqlalchemy.exc import OperationalError, PendingRollbackError, TimeoutError
 
-from ...database.models import UserActiveResearch
+from ...constants import ResearchStatus
+from ...database.models import ResearchHistory, UserActiveResearch
 from ...database.session_context import get_g_db_session
 from .middleware_optimizer import should_skip_database_middleware
 
@@ -53,6 +54,17 @@ def cleanup_completed_research():
             for record in active_records:
                 # Check if this research is still active
                 if not is_research_active(record.research_id):
+                    history_status = (
+                        db_session.query(ResearchHistory.status)
+                        .filter_by(id=record.research_id)
+                        .scalar()
+                    )
+                    if history_status == ResearchStatus.IN_PROGRESS:
+                        # The process-local registry is empty immediately after
+                        # a restart. Preserve the active row (especially its
+                        # settings snapshot) until startup recovery has claimed
+                        # the matching in-progress history row.
+                        continue
                     # Research has completed, clean up the record
                     db_session.delete(record)
                     cleaned_count += 1

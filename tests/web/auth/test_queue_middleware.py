@@ -242,6 +242,99 @@ class TestProcessPendingQueueOperations:
 
                 mock_queue_processor.process_pending_operations_for_user.assert_called_once()
 
+    def test_get_page_load_recovers_interrupted_research_and_wakes_queue(self):
+        """The GET-capable middleware resumes work on the post-login load."""
+        app = Flask(__name__)
+        app.secret_key = "test"
+
+        mock_db_session = MagicMock()
+        mock_queue_processor = MagicMock()
+        mock_queue_processor.recover_interrupted_researches.return_value = 1
+        mock_queue_processor.process_pending_operations_for_user.return_value = 0
+
+        with (
+            patch(
+                "local_deep_research.web.auth.queue_middleware.db_manager"
+            ) as mock_db_manager,
+            patch(
+                "local_deep_research.web.auth.queue_middleware.get_user_db_session"
+            ) as mock_get_session,
+            patch(
+                "local_deep_research.web.auth.queue_middleware.queue_processor",
+                mock_queue_processor,
+            ),
+        ):
+            mock_db_manager.is_user_connected.return_value = True
+            mock_get_session.return_value.__enter__ = MagicMock(
+                return_value=mock_db_session
+            )
+            mock_get_session.return_value.__exit__ = MagicMock(
+                return_value=False
+            )
+
+            from flask import g, session
+            from local_deep_research.web.auth.queue_middleware import (
+                process_pending_queue_operations,
+            )
+
+            with app.test_request_context("/", method="GET"):
+                g.current_user = "testuser"
+                session["session_id"] = "session-1"
+
+                process_pending_queue_operations()
+
+        mock_queue_processor.recover_interrupted_researches.assert_called_once_with(
+            mock_db_session, "testuser"
+        )
+        mock_queue_processor.notify_user_activity.assert_called_once_with(
+            "testuser", "session-1"
+        )
+
+    def test_get_page_load_wakes_queue_already_persisted_before_restart(self):
+        """A crash after durable requeue still resumes on the next GET load."""
+        app = Flask(__name__)
+        app.secret_key = "test"
+
+        mock_db_session = MagicMock()
+        mock_db_session.query.return_value.filter_by.return_value.count.return_value = 1
+        mock_queue_processor = MagicMock()
+        mock_queue_processor.recover_interrupted_researches.return_value = 0
+        mock_queue_processor.process_pending_operations_for_user.return_value = 0
+
+        with (
+            patch(
+                "local_deep_research.web.auth.queue_middleware.db_manager"
+            ) as mock_db_manager,
+            patch(
+                "local_deep_research.web.auth.queue_middleware.get_user_db_session"
+            ) as mock_get_session,
+            patch(
+                "local_deep_research.web.auth.queue_middleware.queue_processor",
+                mock_queue_processor,
+            ),
+        ):
+            mock_db_manager.is_user_connected.return_value = True
+            mock_get_session.return_value.__enter__ = MagicMock(
+                return_value=mock_db_session
+            )
+            mock_get_session.return_value.__exit__ = MagicMock(
+                return_value=False
+            )
+
+            from flask import g, session
+            from local_deep_research.web.auth.queue_middleware import (
+                process_pending_queue_operations,
+            )
+
+            with app.test_request_context("/", method="GET"):
+                g.current_user = "testuser"
+                session["session_id"] = "session-1"
+                process_pending_queue_operations()
+
+        mock_queue_processor.notify_user_activity.assert_called_once_with(
+            "testuser", "session-1"
+        )
+
     def test_handles_exception_gracefully(self):
         """Should handle exceptions gracefully."""
         app = Flask(__name__)

@@ -2794,6 +2794,7 @@ def run_research_process(research_id, query, mode, **kwargs):
                         role="assistant",
                         content=f"Sorry, the research failed: {message}",
                         message_type="response",
+                        research_id=research_id,
                         allow_archived=True,
                     )
                 except Exception:

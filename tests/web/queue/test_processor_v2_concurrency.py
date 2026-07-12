@@ -702,8 +702,8 @@ class TestReclaimStrandedQueueRows:
 
     def test_reclaims_row_without_touching_terminal_status(self, processor):
         """If a stranded row's ResearchHistory is already COMPLETED/FAILED
-        (thread finished cleanly before the crash), only reset
-        is_processing; do NOT overwrite the terminal status."""
+        (thread finished cleanly before the crash), remove the stale queue
+        row and do NOT overwrite the terminal status."""
         from local_deep_research.constants import ResearchStatus
 
         stranded = Mock()
@@ -726,7 +726,7 @@ class TestReclaimStrandedQueueRows:
             )
 
         assert reclaimed == 1
-        assert stranded.is_processing is False
+        mock_session.delete.assert_called_with(stranded)
         # Terminal status untouched.
         assert research_row.status == ResearchStatus.COMPLETED
 

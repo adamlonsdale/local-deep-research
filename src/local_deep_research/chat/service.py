@@ -23,7 +23,10 @@ from ..database.models import (
     ChatRole,
     ChatSession,
     ChatSessionStatus,
+    QueuedResearch,
+    QueueStatus,
     ResearchHistory,
+    TaskMetadata,
     UserActiveResearch,
 )
 from ..database.session_context import get_user_db_session
@@ -674,18 +677,21 @@ class ChatService:
             raise
 
     def get_in_progress_research_id(self, session_id: str) -> Optional[str]:
-        """Return the id of the in-progress research for this chat session,
-        or ``None`` if no research is currently running.
+        """Return the id of active work for this chat session.
+
+        This includes a QUEUED run restored after an application restart, as
+        well as an IN_PROGRESS worker. The client should keep its thinking
+        state and subscription while the normal dispatcher starts the
+        replacement worker.
 
         Used by the GET messages endpoint so the client can restore the
         live "thinking" indicator on reload without inferring it from
         message metadata (which fails during the wrapper-strategy
         preprocessing window before any progress step has persisted).
 
-        The partial-unique index
-        ``ux_research_history_chat_session_in_progress`` (migration 0010)
-        guarantees at most one matching row exists and turns this into
-        an O(1) index lookup.
+        The chat send guard prevents both states from coexisting for one
+        session; the partial unique index additionally enforces the
+        IN_PROGRESS half at the database layer.
         """
         try:
             with get_user_db_session(self.username) as db:
@@ -693,7 +699,12 @@ class ChatService:
                     db.query(ResearchHistory.id)
                     .filter(
                         ResearchHistory.chat_session_id == session_id,
-                        ResearchHistory.status == ResearchStatus.IN_PROGRESS,
+                        ResearchHistory.status.in_(
+                            [
+                                ResearchStatus.IN_PROGRESS,
+                                ResearchStatus.QUEUED,
+                            ]
+                        ),
                     )
                     .first()
                 )
@@ -842,7 +853,12 @@ class ChatService:
                     db.query(ResearchHistory.id)
                     .filter(
                         ResearchHistory.chat_session_id == session_id,
-                        ResearchHistory.status == ResearchStatus.IN_PROGRESS,
+                        ResearchHistory.status.in_(
+                            [
+                                ResearchStatus.IN_PROGRESS,
+                                ResearchStatus.QUEUED,
+                            ]
+                        ),
                     )
                     .first()
                 )
@@ -880,8 +896,9 @@ class ChatService:
             True if deleted successfully
         """
         try:
-            # Terminate any in-progress research tied to this session, so the
-            # FK's ON DELETE SET NULL doesn't leave it alive with a null
+            # Terminate any active or restart-queued research tied to this
+            # session, so the FK's ON DELETE SET NULL doesn't leave it alive
+            # with a null
             # chat_session_id — an orphan that keeps burning LLM cycles for a
             # conversation the user already discarded.
             #
@@ -894,16 +911,66 @@ class ChatService:
                 if not session:
                     return False
                 in_flight = (
-                    db.query(ResearchHistory.id)
+                    db.query(ResearchHistory)
                     .filter(
                         ResearchHistory.chat_session_id == session_id,
-                        ResearchHistory.status == ResearchStatus.IN_PROGRESS,
+                        ResearchHistory.status.in_(
+                            [
+                                ResearchStatus.IN_PROGRESS,
+                                ResearchStatus.QUEUED,
+                            ]
+                        ),
                     )
                     .all()
                 )
+
+                # A restart-recovered turn has no worker to signal yet. Make
+                # its cancellation durable and remove dispatch tracking in
+                # the same transaction as the session delete; otherwise the
+                # queue would later run against a deleted conversation.
+                queued_ids = [
+                    row.id
+                    for row in in_flight
+                    if row.status == ResearchStatus.QUEUED
+                ]
+                running_ids = [
+                    row.id
+                    for row in in_flight
+                    if row.status == ResearchStatus.IN_PROGRESS
+                ]
+                now = datetime.now(UTC)
+                for row in in_flight:
+                    # The in-memory flag is set after commit, but this terminal
+                    # write must be durable first. If the container dies in
+                    # that gap, restart recovery must not resurrect work for a
+                    # chat that has already been deleted.
+                    row.status = ResearchStatus.SUSPENDED
+                    row.completed_at = now.isoformat()
+                if queued_ids:
+                    db.query(QueuedResearch).filter(
+                        QueuedResearch.research_id.in_(queued_ids)
+                    ).delete(synchronize_session=False)
+                    for task in (
+                        db.query(TaskMetadata)
+                        .filter(TaskMetadata.task_id.in_(queued_ids))
+                        .all()
+                    ):
+                        task.status = ResearchStatus.SUSPENDED
+                        task.completed_at = now
+
+                    queue_status = db.query(QueueStatus).first()
+                    if queue_status is not None:
+                        db.flush()
+                        queue_status.queued_tasks = (
+                            db.query(TaskMetadata)
+                            .filter_by(status=ResearchStatus.QUEUED)
+                            .count()
+                        )
+                        queue_status.last_checked = now
+
                 db.delete(session)
                 db.commit()
-                for (rid,) in in_flight:
+                for rid in running_ids:
                     set_termination_flag(rid)
                 # Include the (truncated) username so a stolen-token bulk
                 # delete leaves a forensic trail tying each deletion to an
@@ -1079,6 +1146,29 @@ class ChatService:
                 db.query(UserActiveResearch).filter(
                     UserActiveResearch.research_id == research_id
                 ).delete(synchronize_session=False)
+
+                # Restart recovery dispatches through QueuedResearch and
+                # TaskMetadata. Deleting/retrying that attempt must remove the
+                # durable claim too, or the queue will later run an orphaned
+                # research id and emit a spurious failure beside the retry.
+                db.query(QueuedResearch).filter(
+                    QueuedResearch.research_id == research_id
+                ).delete(synchronize_session=False)
+                task = db.get(TaskMetadata, research_id)
+                if task is not None:
+                    task_status = task.status
+                    db.delete(task)
+                    queue_status = db.query(QueueStatus).first()
+                    if queue_status is not None:
+                        if task_status == ResearchStatus.QUEUED:
+                            queue_status.queued_tasks = max(
+                                0, queue_status.queued_tasks - 1
+                            )
+                        elif task_status == "processing":
+                            queue_status.active_tasks = max(
+                                0, queue_status.active_tasks - 1
+                            )
+                        queue_status.last_checked = datetime.now(UTC)
 
                 # ResearchHistory last so its CASCADE doesn't fire while
                 # our explicit deletes are pending.

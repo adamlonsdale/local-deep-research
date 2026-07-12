@@ -353,13 +353,13 @@ class TestStartFollowupSuccess:
         with (
             patch(AUTH_DB_MANAGER, _mock_auth()),
             patch(SETTINGS_MANAGER, return_value=_make_settings_mock()),
-            _mock_db_session_ctx(),
+            _mock_db_session_ctx() as mock_db,
             patch(
                 f"{MODULE}.FollowUpResearchService", return_value=mock_service
             ),
-            patch(START_RESEARCH),
+            patch(START_RESEARCH) as mock_start,
             patch(RUN_RESEARCH),
-            patch(RESEARCH_HISTORY),
+            patch(RESEARCH_HISTORY) as mock_history,
             patch(
                 "uuid.uuid4",
                 return_value=Mock(__str__=lambda s: "new-research-id"),
@@ -379,6 +379,23 @@ class TestStartFollowupSuccess:
         assert data["success"] is True
         assert "research_id" in data
         assert data["message"] == "Follow-up research started"
+
+        # The durable row contains every contextual launch argument required
+        # to replay this same run after a process/container restart.
+        history_kwargs = mock_history.call_args.kwargs
+        metadata = history_kwargs["research_meta"]
+        submission = metadata["submission"]
+        assert metadata["settings_snapshot"] == _fake_settings_snapshot()
+        assert submission["strategy"] == "enhanced-contextual-followup"
+        assert submission["parent_research_id"] == "parent-1"
+        assert submission["research_context"] == {"summary": "context"}
+        assert submission["iterations"] == 2
+        assert submission["questions_per_iteration"] == 4
+        assert mock_db.add.called
+        assert (
+            mock_start.call_args.kwargs["research_context"]
+            == submission["research_context"]
+        )
 
 
 class TestStartFollowupModelRequired:

@@ -93,6 +93,27 @@ def test_archive_blocked_when_research_in_progress(
         assert row.status == ChatSessionStatus.ACTIVE.value
 
 
+def test_archive_blocked_when_recovered_research_is_queued(
+    setup_database_for_all_tests,
+):
+    """A restart-recovered queued turn still owns the chat session."""
+    SessionLocal = setup_database_for_all_tests
+    username = f"alice_{uuid.uuid4().hex[:8]}"
+    service = ChatService(username=username)
+
+    with SessionLocal() as db:
+        session_id, _ = _seed_session_and_research(
+            db, status=ResearchStatus.QUEUED.value
+        )
+
+    with pytest.raises(ArchiveBlockedError):
+        _run_archive(SessionLocal, service, session_id)
+
+    with SessionLocal() as db:
+        row = db.query(ChatSession).filter_by(id=session_id).first()
+        assert row.status == ChatSessionStatus.ACTIVE.value
+
+
 def test_archive_succeeds_when_research_completed(
     setup_database_for_all_tests,
 ):

@@ -3,19 +3,29 @@ Queue processor v2 - uses encrypted user databases instead of service.db
 Supports both direct execution and queue modes.
 """
 
+import json
 import threading
 import time
 import uuid
+from datetime import UTC, datetime
 from typing import Any, Dict, Optional
 
 from loguru import logger
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ...constants import ResearchStatus
 from ...database.encrypted_db import db_manager
 from ...database.models import (
+    ChatMessage,
+    ChatProgressStep,
+    ChatRole,
+    ChatSession,
     QueuedResearch,
+    QueueStatus,
     ResearchHistory,
+    ResearchResource,
+    TaskMetadata,
     UserActiveResearch,
 )
 from ...database.queue_service import UserQueueService
@@ -41,6 +51,19 @@ RETRY_BACKOFF_MULTIPLIER = 2
 # Each failure leaves is_processing=False so the next loop tick retries.
 SPAWN_RETRY_LIMIT = 3
 
+# A research that crashes the whole process on every replay must not create an
+# endless container restart loop. The counter lives in the already-encrypted
+# research metadata, so no schema migration is required.
+RECOVERY_REPLAY_LIMIT = 3
+
+TERMINAL_RESEARCH_STATUSES = {
+    ResearchStatus.COMPLETED,
+    ResearchStatus.SUSPENDED,
+    ResearchStatus.FAILED,
+    ResearchStatus.ERROR,
+    ResearchStatus.CANCELLED,
+}
+
 
 class QueueProcessorV2:
     """
@@ -58,6 +81,12 @@ class QueueProcessorV2:
         self.check_interval = check_interval
         self.running = False
         self.thread = None
+        # The queue loop is a long-lived background thread. Keep the Flask
+        # application object so the loop can push an application context
+        # before it dispatches research worker threads. Without this,
+        # thread_context() returns None and workers started from the queue
+        # crash as soon as log_for_research touches flask.g.
+        self._flask_app = None
         self._loop_iteration = 0
         # Wakes the loop out of its inter-iteration wait so stop() returns
         # in milliseconds instead of blocking for up to check_interval.
@@ -99,6 +128,17 @@ class QueueProcessorV2:
         # request paths can interleave.
         self._spawn_retry_counts: dict[str, int] = {}
         self._spawn_retry_counts_lock = threading.Lock()
+
+        # Startup recovery is intentionally per-process and per-user. User
+        # databases are encrypted, so they cannot be inspected until the first
+        # authenticated request supplies the password after a restart. The
+        # cutoff separates rows inherited from the previous process from rows
+        # created by a request racing with the recovery middleware in this one.
+        self._recovery_cutoff = datetime.now(UTC)
+        self._recovered_users: set[str] = set()
+        self._recovering_users: set[str] = set()
+        self._recovery_lock = threading.Lock()
+        self._recovery_condition = threading.Condition(self._recovery_lock)
 
     def _get_user_critical_lock(self, username: str) -> threading.Lock:
         """Get (or lazily create) the per-user lock used to serialise the
@@ -211,19 +251,684 @@ class QueueProcessorV2:
                     exc_info=True,
                 )
 
-    def start(self):
+    @staticmethod
+    def _metadata_dict(value: Any) -> dict[str, Any]:
+        """Return research metadata as a detached dict.
+
+        Older databases can contain a JSON string despite the ORM column being
+        JSON today. Recovery is deliberately tolerant because leaving a legacy
+        row permanently IN_PROGRESS is worse than falling back to current user
+        settings for a replay.
+        """
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return dict(parsed) if isinstance(parsed, dict) else {}
+            except (TypeError, ValueError):
+                return {}
+        return {}
+
+    @staticmethod
+    def _snapshot_value(
+        snapshot: dict[str, Any], key: str, default: Any = None
+    ) -> Any:
+        """Read either SettingsManager's wrapped or a legacy flat value."""
+        value = snapshot.get(key, default)
+        if isinstance(value, dict) and "value" in value:
+            return value.get("value", default)
+        return value
+
+    def _started_before_recovery_cutoff(self, value: Any) -> bool:
+        """Whether a persisted timestamp predates this processor boot.
+
+        Unparseable/missing legacy timestamps are treated as old. The live
+        process registry is checked separately before this helper is used, so
+        this fallback repairs old rows without risking a known-live thread.
+        """
+        if value is None:
+            return True
+        try:
+            if isinstance(value, str):
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            elif isinstance(value, datetime):
+                parsed = value
+            else:
+                return True
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed < self._recovery_cutoff
+        except (TypeError, ValueError, OverflowError):
+            return True
+
+    def _build_recovery_payload(
+        self,
+        db_session: Session,
+        research: ResearchHistory,
+        active_record: UserActiveResearch | None,
+    ) -> dict[str, Any] | None:
+        """Reconstruct the queue launch envelope for an interrupted run.
+
+        Standard research already persists the exact ``submission`` plus a
+        complete settings snapshot in ``research_meta``. Chat historically put
+        only its identifiers in history and kept the settings snapshot on the
+        active row, so that is the second source. Very old non-contextual rows
+        can fall back to current settings; contextual rows without their exact
+        saved context are failed explicitly rather than replayed incorrectly.
+        """
+        history_meta = self._metadata_dict(research.research_meta)
+        active_meta = self._metadata_dict(
+            active_record.settings_snapshot
+            if active_record is not None
+            else None
+        )
+
+        envelope: dict[str, Any] = {}
+        settings_snapshot: dict[str, Any] = {}
+        for candidate in (history_meta, active_meta):
+            candidate_settings = candidate.get("settings_snapshot")
+            if isinstance(candidate_settings, dict) and candidate_settings:
+                envelope = dict(candidate)
+                settings_snapshot = dict(candidate_settings)
+                break
+
+        # Chat's UserActiveResearch row contains the raw snapshot rather than
+        # the standard wrapper. Accept that shape before reading live settings.
+        if not settings_snapshot and active_meta:
+            settings_snapshot = dict(active_meta)
+
+        if not settings_snapshot:
+            try:
+                from ...settings.manager import SettingsManager
+
+                settings_snapshot = SettingsManager(
+                    db_session
+                ).get_all_settings(bypass_cache=True)
+            except Exception:
+                logger.exception(
+                    f"Could not reconstruct settings for interrupted research "
+                    f"{research.id}"
+                )
+                return None
+
+        if not isinstance(settings_snapshot, dict) or not settings_snapshot:
+            return None
+
+        submission: dict[str, Any] = {}
+        if isinstance(envelope.get("submission"), dict):
+            submission.update(envelope["submission"])
+        if isinstance(history_meta.get("submission"), dict):
+            # History holds chat/follow-up identifiers not present in the raw
+            # active-row snapshot; preserve them when merging sources.
+            submission.update(history_meta["submission"])
+
+        defaults = {
+            "model_provider": self._snapshot_value(
+                settings_snapshot, "llm.provider", "ollama"
+            ),
+            "model": self._snapshot_value(settings_snapshot, "llm.model"),
+            "custom_endpoint": self._snapshot_value(
+                settings_snapshot, "llm.openai_endpoint.url"
+            ),
+            "search_engine": self._snapshot_value(
+                settings_snapshot, "search.tool"
+            ),
+            "max_results": self._snapshot_value(
+                settings_snapshot, "search.max_results"
+            ),
+            "time_period": self._snapshot_value(
+                settings_snapshot, "search.time_period"
+            ),
+            "iterations": self._snapshot_value(
+                settings_snapshot, "search.iterations", 3
+            ),
+            "questions_per_iteration": self._snapshot_value(
+                settings_snapshot, "search.questions_per_iteration", 2
+            ),
+            "strategy": self._snapshot_value(
+                settings_snapshot, "search.search_strategy", "source-based"
+            ),
+        }
+        for key, value in defaults.items():
+            if submission.get(key) is None:
+                submission[key] = value
+
+        chat_session_id = research.chat_session_id or submission.get(
+            "chat_session_id"
+        )
+        if chat_session_id:
+            if db_session.get(ChatSession, chat_session_id) is None:
+                logger.warning(
+                    f"Interrupted chat research {research.id} references "
+                    f"missing chat session {chat_session_id}"
+                )
+                return None
+            submission["chat_session_id"] = chat_session_id
+            submission.setdefault(
+                "chat_message_id", submission.get("message_id")
+            )
+
+        # Contextual runs cannot be reconstructed faithfully from identifiers
+        # alone. New rows persist this envelope at creation time; older rows
+        # are made terminal rather than silently replayed as a first-turn or
+        # context-free research with a semantically different answer.
+        needs_context = bool(
+            chat_session_id
+            or submission.get("parent_research_id")
+            or submission.get("strategy")
+            in {"contextual-followup", "enhanced-contextual-followup"}
+        )
+        if needs_context and not isinstance(
+            submission.get("research_context"), dict
+        ):
+            logger.warning(
+                f"Interrupted contextual research {research.id} has no saved "
+                "research context and cannot be replayed faithfully"
+            )
+            return None
+
+        payload = dict(envelope or history_meta)
+        payload["submission"] = submission
+        payload["settings_snapshot"] = settings_snapshot
+        return payload
+
+    @staticmethod
+    def _append_recovery_log(
+        research: ResearchHistory, timestamp: str, message: str
+    ) -> None:
+        """Append a user-visible recovery marker when the log is list-shaped."""
+        current = research.progress_log
+        if isinstance(current, str):
+            try:
+                current = json.loads(current)
+            except (TypeError, ValueError):
+                current = []
+        if isinstance(current, dict):
+            current = [current]
+        elif not isinstance(current, list):
+            current = []
+        research.progress_log = [
+            *current,
+            {"time": timestamp, "progress": 0, "message": message},
+        ]
+
+    @staticmethod
+    def _finish_recovery_row(
+        db_session: Session,
+        username: str,
+        research_id: str,
+        status: ResearchStatus,
+        active_record: UserActiveResearch | None,
+    ) -> None:
+        """Remove stale dispatch rows and make task metadata terminal."""
+        queued = (
+            db_session.query(QueuedResearch)
+            .filter_by(username=username, research_id=research_id)
+            .first()
+        )
+        if queued is not None:
+            db_session.delete(queued)
+        task = (
+            db_session.query(TaskMetadata)
+            .filter_by(task_id=research_id)
+            .first()
+        )
+        if task is not None:
+            task.status = status
+            task.completed_at = datetime.now(UTC)
+        if active_record is not None:
+            db_session.delete(active_record)
+
+    @staticmethod
+    def _rebuild_queue_status(
+        db_session: Session, username: str
+    ) -> QueueStatus:
+        """Rebuild denormalized counts from research rows with live ownership.
+
+        TaskMetadata and UserActiveResearch are deliberately not trusted on
+        their own: both can survive a crash after ResearchHistory has already
+        become terminal. Counting those ghosts would permanently consume a
+        concurrency slot after restart.
+        """
+        db_session.flush()
+        queued_count = (
+            db_session.query(TaskMetadata)
+            .join(
+                ResearchHistory,
+                ResearchHistory.id == TaskMetadata.task_id,
+            )
+            .join(
+                QueuedResearch,
+                QueuedResearch.research_id == TaskMetadata.task_id,
+            )
+            .filter(
+                TaskMetadata.status == ResearchStatus.QUEUED,
+                ResearchHistory.status == ResearchStatus.QUEUED,
+                QueuedResearch.username == username,
+                QueuedResearch.is_processing.is_(False),
+            )
+            .count()
+        )
+        processing_ids = {
+            task_id
+            for (task_id,) in db_session.query(TaskMetadata.task_id)
+            .join(
+                ResearchHistory,
+                ResearchHistory.id == TaskMetadata.task_id,
+            )
+            .filter(
+                TaskMetadata.status == "processing",
+                ResearchHistory.status == ResearchStatus.IN_PROGRESS,
+            )
+            .all()
+        }
+        active_research_ids = {
+            research_id
+            for (research_id,) in db_session.query(
+                UserActiveResearch.research_id
+            )
+            .join(
+                ResearchHistory,
+                ResearchHistory.id == UserActiveResearch.research_id,
+            )
+            .filter(
+                UserActiveResearch.username == username,
+                UserActiveResearch.status == ResearchStatus.IN_PROGRESS,
+                ResearchHistory.status == ResearchStatus.IN_PROGRESS,
+            )
+            .all()
+        }
+        queue_status = db_session.query(QueueStatus).first()
+        if queue_status is None:
+            queue_status = QueueStatus()
+            db_session.add(queue_status)
+        queue_status.queued_tasks = queued_count
+        queue_status.active_tasks = len(processing_ids | active_research_ids)
+        queue_status.last_checked = datetime.now(UTC)
+        return queue_status
+
+    def recover_interrupted_researches(
+        self, db_session: Session, username: str
+    ) -> int:
+        """Durably re-queue research workers lost in a process restart.
+
+        This is called on the first authenticated page load, once the user's
+        encrypted database is unlocked. It scans visible history rather than
+        only ``UserActiveResearch`` because a crash can happen between those
+        two inserts. Eligible rows are atomically changed IN_PROGRESS→QUEUED,
+        supplied with a queue row and task metadata, and then picked up by the
+        normal dispatcher (which owns capacity checks and spawn retries).
+
+        Returns the number of interrupted researches made runnable again.
+        """
+        from ..routes.globals import is_research_thread_alive
+
+        with self._recovery_condition:
+            # A second authenticated request must wait for the first recovery
+            # transaction. Returning immediately would let its later cleanup
+            # middleware mutate the same stale rows midway through repair.
+            while username in self._recovering_users:
+                self._recovery_condition.wait()
+            if username in self._recovered_users:
+                return 0
+            self._recovering_users.add(username)
+
+        succeeded = False
+        recovered = 0
+        try:
+            with self._get_user_critical_lock(username):
+                histories = (
+                    db_session.query(ResearchHistory)
+                    .filter(
+                        ResearchHistory.status == ResearchStatus.IN_PROGRESS
+                    )
+                    .all()
+                )
+                active_rows = (
+                    db_session.query(UserActiveResearch)
+                    .filter_by(
+                        username=username,
+                        status=ResearchStatus.IN_PROGRESS,
+                    )
+                    .all()
+                )
+                active_by_id = {row.research_id: row for row in active_rows}
+                next_position = (
+                    db_session.query(func.max(QueuedResearch.position))
+                    .filter_by(username=username)
+                    .scalar()
+                    or 0
+                )
+                now_iso = datetime.now(UTC).isoformat()
+
+                for research in histories:
+                    if is_research_thread_alive(research.id):
+                        continue
+
+                    active_record = active_by_id.get(research.id)
+                    persisted_start = (
+                        active_record.started_at
+                        if active_record is not None
+                        else research.created_at
+                    )
+                    if not self._started_before_recovery_cutoff(
+                        persisted_start
+                    ):
+                        # A current-process request committed the row but has
+                        # not registered its worker thread yet.
+                        continue
+
+                    metadata = self._metadata_dict(research.research_meta)
+                    resume_count = metadata.get("resume_count", 0)
+                    try:
+                        resume_count = int(resume_count)
+                    except (TypeError, ValueError):
+                        resume_count = 0
+
+                    if (
+                        metadata.get("error_report")
+                        or resume_count >= RECOVERY_REPLAY_LIMIT
+                    ):
+                        research.status = ResearchStatus.FAILED
+                        research.completed_at = now_iso
+                        metadata["recovery_error"] = (
+                            "Research could not be resumed after restart"
+                            if resume_count < RECOVERY_REPLAY_LIMIT
+                            else "Research exceeded the automatic resume limit"
+                        )
+                        research.research_meta = metadata
+                        self._append_recovery_log(
+                            research, now_iso, metadata["recovery_error"]
+                        )
+                        self._finish_recovery_row(
+                            db_session,
+                            username,
+                            research.id,
+                            ResearchStatus.FAILED,
+                            active_record,
+                        )
+                        continue
+
+                    payload = self._build_recovery_payload(
+                        db_session, research, active_record
+                    )
+                    if payload is None:
+                        research.status = ResearchStatus.FAILED
+                        research.completed_at = now_iso
+                        metadata["recovery_error"] = (
+                            "Saved launch settings or context were unavailable "
+                            "after restart"
+                        )
+                        research.research_meta = metadata
+                        self._append_recovery_log(
+                            research, now_iso, metadata["recovery_error"]
+                        )
+                        self._finish_recovery_row(
+                            db_session,
+                            username,
+                            research.id,
+                            ResearchStatus.FAILED,
+                            active_record,
+                        )
+                        continue
+
+                    # Durable compare-and-set claim. A second app worker that
+                    # unlocks the same DB cannot also replay this research.
+                    claimed = (
+                        db_session.query(ResearchHistory)
+                        .filter_by(
+                            id=research.id,
+                            status=ResearchStatus.IN_PROGRESS,
+                        )
+                        .update(
+                            {ResearchHistory.status: ResearchStatus.QUEUED},
+                            synchronize_session=False,
+                        )
+                    )
+                    if not claimed:
+                        continue
+                    research.status = ResearchStatus.QUEUED
+                    research.progress = 0
+                    research.completed_at = None
+                    research.duration_seconds = None
+                    # Replay uses the same research_id. Remove attempt-local
+                    # output first: report storage overwrites the answer, while
+                    # source storage intentionally refuses to write if *any*
+                    # sources already exist, which would otherwise pair a new
+                    # answer with partial sources from the crashed attempt.
+                    research.report_content = None
+                    research.report_path = None
+                    db_session.query(ResearchResource).filter_by(
+                        research_id=research.id
+                    ).delete(synchronize_session=False)
+                    db_session.query(ChatProgressStep).filter_by(
+                        research_id=research.id
+                    ).delete(synchronize_session=False)
+                    removed_chat_messages = (
+                        db_session.query(ChatMessage)
+                        .filter(
+                            ChatMessage.research_id == research.id,
+                            ChatMessage.role == ChatRole.ASSISTANT,
+                        )
+                        .delete(synchronize_session=False)
+                    )
+                    if removed_chat_messages and research.chat_session_id:
+                        chat_session = db_session.get(
+                            ChatSession, research.chat_session_id
+                        )
+                        if chat_session is not None:
+                            chat_session.message_count = max(
+                                0,
+                                chat_session.message_count
+                                - removed_chat_messages,
+                            )
+                    research.step_count = 0
+                    metadata.update(
+                        {
+                            "resume_count": resume_count + 1,
+                            "resumed_at": now_iso,
+                            "resume_reason": "application_restart",
+                        }
+                    )
+                    # Preserve the canonical launch envelope in history for a
+                    # later restart, including history-only crash windows.
+                    metadata["submission"] = payload["submission"]
+                    metadata["settings_snapshot"] = payload["settings_snapshot"]
+                    research.research_meta = metadata
+                    self._append_recovery_log(
+                        research,
+                        now_iso,
+                        "Application restarted; resuming research from the beginning",
+                    )
+
+                    queued = (
+                        db_session.query(QueuedResearch)
+                        .filter_by(username=username, research_id=research.id)
+                        .first()
+                    )
+                    if queued is None:
+                        next_position += 1
+                        queued = QueuedResearch(
+                            username=username,
+                            research_id=research.id,
+                            query=research.query,
+                            mode=research.mode,
+                            settings_snapshot=payload,
+                            position=next_position,
+                            is_processing=False,
+                        )
+                        db_session.add(queued)
+                    else:
+                        queued.query = research.query
+                        queued.mode = research.mode
+                        queued.settings_snapshot = payload
+                        queued.is_processing = False
+
+                    task = (
+                        db_session.query(TaskMetadata)
+                        .filter_by(task_id=research.id)
+                        .first()
+                    )
+                    if task is None:
+                        db_session.add(
+                            TaskMetadata(
+                                task_id=research.id,
+                                task_type="research",
+                                status=ResearchStatus.QUEUED,
+                            )
+                        )
+                    else:
+                        task.status = ResearchStatus.QUEUED
+                        task.started_at = None
+                        task.completed_at = None
+                        task.error_message = None
+
+                    if active_record is not None:
+                        db_session.delete(active_record)
+                    recovered += 1
+                    logger.warning(
+                        f"Recovered interrupted research {research.id} for "
+                        f"user {username}; queued for replay"
+                    )
+
+                # A crash can also land between the durable QueuedResearch
+                # insert and TaskMetadata creation. Repair that window even
+                # when history was already QUEUED (and therefore absent from
+                # the IN_PROGRESS recovery scan above).
+                for queued_row in (
+                    db_session.query(QueuedResearch)
+                    .filter_by(username=username)
+                    .all()
+                ):
+                    queued_history = (
+                        db_session.query(ResearchHistory)
+                        .filter_by(id=queued_row.research_id)
+                        .first()
+                    )
+                    task = (
+                        db_session.query(TaskMetadata)
+                        .filter_by(task_id=queued_row.research_id)
+                        .first()
+                    )
+                    if queued_history is None:
+                        if task is not None:
+                            task.status = ResearchStatus.FAILED
+                            task.completed_at = datetime.now(UTC)
+                        db_session.delete(queued_row)
+                        continue
+                    if queued_history.status in TERMINAL_RESEARCH_STATUSES:
+                        if task is not None:
+                            task.status = queued_history.status
+                            task.completed_at = datetime.now(UTC)
+                        db_session.delete(queued_row)
+                        continue
+                    if task is None:
+                        db_session.add(
+                            TaskMetadata(
+                                task_id=queued_row.research_id,
+                                task_type="research",
+                                status=ResearchStatus.QUEUED,
+                            )
+                        )
+                    elif (
+                        not queued_row.is_processing
+                        and task.status != ResearchStatus.QUEUED
+                    ):
+                        task.status = ResearchStatus.QUEUED
+                        task.started_at = None
+                        task.completed_at = None
+                        task.error_message = None
+
+                # Reconcile crash leftovers that no longer have a queue row.
+                # A normal completion can persist terminal history just before
+                # the process dies, leaving both tracking tables looking live.
+                terminal_values = tuple(TERMINAL_RESEARCH_STATUSES)
+                for task, terminal_status in (
+                    db_session.query(TaskMetadata, ResearchHistory.status)
+                    .join(
+                        ResearchHistory,
+                        ResearchHistory.id == TaskMetadata.task_id,
+                    )
+                    .filter(
+                        TaskMetadata.status.in_(
+                            [ResearchStatus.QUEUED, "processing"]
+                        ),
+                        ResearchHistory.status.in_(terminal_values),
+                    )
+                    .all()
+                ):
+                    task.status = terminal_status
+                    task.completed_at = datetime.now(UTC)
+
+                for stale_active in (
+                    db_session.query(UserActiveResearch)
+                    .join(
+                        ResearchHistory,
+                        ResearchHistory.id == UserActiveResearch.research_id,
+                    )
+                    .filter(
+                        UserActiveResearch.username == username,
+                        UserActiveResearch.status == ResearchStatus.IN_PROGRESS,
+                        ResearchHistory.status.in_(terminal_values),
+                    )
+                    .all()
+                ):
+                    db_session.delete(stale_active)
+
+                # QueueStatus is denormalized and is commonly left at
+                # active=1/queued=0 by a crash after the processing claim.
+                # Rebuild it from task metadata so the dispatcher cannot take
+                # its old queued_tasks==0 early exit.
+                self._rebuild_queue_status(db_session, username)
+
+                db_session.commit()
+                succeeded = True
+                return recovered
+        except Exception:
+            db_session.rollback()
+            logger.exception(
+                f"Interrupted research recovery failed for user {username}"
+            )
+            raise
+        finally:
+            with self._recovery_condition:
+                self._recovering_users.discard(username)
+                if succeeded:
+                    self._recovered_users.add(username)
+                self._recovery_condition.notify_all()
+
+    def _run_queue_loop_with_app_context(self):
+        """Run the background queue loop inside the owning Flask app."""
+        if self._flask_app is None:
+            return self._process_queue_loop()
+
+        with self._flask_app.app_context():
+            return self._process_queue_loop()
+
+    def start(self, app=None):
         """Start the queue processor thread."""
         if self.running:
             logger.warning("Queue processor already running")
             return
 
+        if app is not None:
+            self._flask_app = app
+
         self.running = True
+        # A stop/start cycle is the in-process equivalent of a fresh worker
+        # boot (used heavily by the test suite). Re-arm recovery and take a new
+        # boundary before accepting requests.
+        with self._recovery_lock:
+            self._recovery_cutoff = datetime.now(UTC)
+            self._recovered_users.clear()
+            self._recovering_users.clear()
         # Re-arm the wait for restart: stop() leaves the event set, and
         # create_app() restarts this singleton after the test-suite
         # teardown stops it.
         self._stop_event.clear()
         self.thread = threading.Thread(
-            target=self._process_queue_loop, daemon=True
+            target=self._run_queue_loop_with_app_context, daemon=True
         )
         self.thread.start()
         logger.info("Queue processor v2 started")
@@ -765,6 +1470,14 @@ class QueueProcessorV2:
             with get_user_db_session(username, password) as db_session:
                 queue_service = UserQueueService(db_session)
 
+                # Run crash reclamation before consulting denormalized queue
+                # counters. The interrupted claim state is normally
+                # queued_tasks=0/active_tasks=1, so the old ordering returned
+                # early and never reached the reclaim helper.
+                self._reclaim_stranded_queue_rows(
+                    db_session, username, queue_service=queue_service
+                )
+
                 # Get user's settings using SettingsManager
                 from ...settings.manager import SettingsManager
 
@@ -781,20 +1494,40 @@ class QueueProcessorV2:
                     "queued_tasks": 0,
                 }
 
+                if queue_status["queued_tasks"] == 0:
+                    return True
+
+                # Direct-mode research creates UserActiveResearch without a
+                # TaskMetadata row, so QueueStatus alone can undercount live
+                # work. This matters when a recovered queue is dispatched on
+                # the same request that starts a fresh direct run.
+                active_research_count = (
+                    db_session.query(UserActiveResearch)
+                    .join(
+                        ResearchHistory,
+                        ResearchHistory.id == UserActiveResearch.research_id,
+                    )
+                    .filter(
+                        UserActiveResearch.username == username,
+                        UserActiveResearch.status == ResearchStatus.IN_PROGRESS,
+                        ResearchHistory.status == ResearchStatus.IN_PROGRESS,
+                    )
+                    .count()
+                )
+                active_count = max(
+                    queue_status["active_tasks"], active_research_count
+                )
+
                 # Calculate available slots
-                available_slots = max_concurrent - queue_status["active_tasks"]
+                available_slots = max_concurrent - active_count
 
                 if available_slots <= 0:
                     # No slots available, but queue might not be empty
                     return False  # Keep checking
 
-                if queue_status["queued_tasks"] == 0:
-                    # Queue is empty
-                    return True  # Remove from checking
-
                 logger.info(
                     f"Processing queue for {username}: "
-                    f"{queue_status['active_tasks']} active, "
+                    f"{active_count} active, "
                     f"{queue_status['queued_tasks']} queued, "
                     f"{available_slots} slots available"
                 )
@@ -824,7 +1557,10 @@ class QueueProcessorV2:
             return False  # Keep checking - errors might be temporary
 
     def _reclaim_stranded_queue_rows(
-        self, db_session: Session, username: str
+        self,
+        db_session: Session,
+        username: str,
+        queue_service: UserQueueService | None = None,
     ) -> int:
         """Reclaim queue rows stranded by a crash or restart.
 
@@ -836,9 +1572,10 @@ class QueueProcessorV2:
         query and would never be retried.
 
         Reverts ``QueuedResearch.is_processing`` to False and — if
-        ``ResearchHistory.status`` is still IN_PROGRESS with no live
-        thread — reverts that to QUEUED so the next tick can freshly
-        spawn. Returns the number of rows reclaimed.
+        ``ResearchHistory.status`` is still IN_PROGRESS with no live thread —
+        reverts that to QUEUED so the next tick can freshly spawn. Terminal
+        history rows have their stale queue rows removed instead. Returns the
+        number of rows reclaimed.
         """
         from ..routes.globals import is_research_active
 
@@ -852,18 +1589,57 @@ class QueueProcessorV2:
             if is_research_active(row.research_id):
                 # A legitimate in-flight claim; don't touch.
                 continue
-            row.is_processing = False
             research = (
                 db_session.query(ResearchHistory)
                 .filter_by(id=row.research_id)
                 .first()
             )
+
+            task = None
+            if queue_service is not None:
+                task = (
+                    db_session.query(TaskMetadata)
+                    .filter_by(task_id=row.research_id)
+                    .first()
+                )
+
+            # A worker can finish and persist terminal history immediately
+            # before the process dies, leaving only its queue/active tracking
+            # behind. Never turn that terminal run back into queued work.
+            if (
+                research is not None
+                and research.status in TERMINAL_RESEARCH_STATUSES
+            ):
+                if task is not None:
+                    task.status = research.status
+                    task.completed_at = datetime.now(UTC)
+                db_session.delete(row)
+                reclaimed += 1
+                logger.warning(
+                    f"Removed terminal stranded queue row for research "
+                    f"{row.research_id} (user {username})"
+                )
+                continue
+
+            row.is_processing = False
             status_changed = (
                 research is not None
                 and research.status == ResearchStatus.IN_PROGRESS
             )
             if status_changed:
                 research.status = ResearchStatus.QUEUED
+            if queue_service is not None:
+                if task is None:
+                    queue_service.add_task_metadata(
+                        task_id=row.research_id,
+                        task_type="research",
+                    )
+                elif task.status == "processing":
+                    # Adjust QueueStatus using its normal transition logic so
+                    # the reclaimed row becomes visible to the dispatcher.
+                    queue_service.update_task_status(
+                        row.research_id, ResearchStatus.QUEUED
+                    )
             reclaimed += 1
             logger.warning(
                 f"Reclaimed stranded queue row for research "
@@ -872,6 +1648,8 @@ class QueueProcessorV2:
                 + (" and status=QUEUED" if status_changed else "")
             )
         if reclaimed:
+            if queue_service is not None:
+                self._rebuild_queue_status(db_session, username)
             if not self._commit_with_safe_rollback(
                 db_session,
                 f"reclaim of stranded rows for user {username}",
@@ -972,7 +1750,37 @@ class QueueProcessorV2:
                 )
                 with self._spawn_retry_counts_lock:
                     self._spawn_retry_counts.pop(research_id, None)
+                duplicate_history = (
+                    db_session.query(ResearchHistory)
+                    .filter_by(id=research_id)
+                    .first()
+                )
+                terminal_status = (
+                    duplicate_history.status
+                    if duplicate_history is not None
+                    and duplicate_history.status in TERMINAL_RESEARCH_STATUSES
+                    else None
+                )
                 self._delete_queue_row_safely(db_session, username, research_id)
+                if terminal_status is not None:
+                    # A recovered queued run may be stopped before its
+                    # replacement worker starts. The dispatch claim has
+                    # already moved TaskMetadata queued→processing; deleting
+                    # only the queue row would leak active_tasks=1 forever.
+                    terminal_task = (
+                        db_session.query(TaskMetadata)
+                        .filter_by(task_id=research_id)
+                        .first()
+                    )
+                    if terminal_task is not None:
+                        terminal_task.status = terminal_status
+                        terminal_task.completed_at = datetime.now(UTC)
+                    self._rebuild_queue_status(db_session, username)
+                    self._commit_with_safe_rollback(
+                        db_session,
+                        "terminal duplicate tracking cleanup for research "
+                        f"{research_id}",
+                    )
                 continue
 
             except SystemAtCapacityError:
@@ -1039,10 +1847,9 @@ class QueueProcessorV2:
                 )
 
                 if attempts < SPAWN_RETRY_LIMIT:
-                    # Transient failure — allow the next loop tick to
-                    # retry. _start_research rolls back its own
-                    # IN_PROGRESS write on spawn failure, so the only
-                    # fix-up needed here is resetting is_processing.
+                    # Transient failure — allow the next loop tick to retry.
+                    # _start_research rolls back its own IN_PROGRESS write;
+                    # release both the queue-row and TaskMetadata claims.
                     logger.warning(
                         f"Spawn failed for research {research_id} "
                         f"(attempt {attempts}/{SPAWN_RETRY_LIMIT}), "
@@ -1050,6 +1857,13 @@ class QueueProcessorV2:
                     )
                     if fresh_queued:
                         fresh_queued.is_processing = False
+                        # update_task_status("processing") committed before
+                        # _start_research ran. Revert that durable claim too;
+                        # otherwise queued_tasks remains zero and the next
+                        # loop exits before this retryable row is considered.
+                        queue_service.update_task_status(
+                            research_id, ResearchStatus.QUEUED
+                        )
                         self._commit_with_safe_rollback(
                             db_session,
                             f"is_processing reset for research {research_id}",
@@ -1200,6 +2014,11 @@ class QueueProcessorV2:
                     "questions_per_iteration"
                 ),
                 strategy=submission_params.get("strategy", "source-based"),
+                research_context=submission_params.get("research_context"),
+                chat_session_id=submission_params.get("chat_session_id"),
+                chat_message_id=submission_params.get("chat_message_id"),
+                parent_research_id=submission_params.get("parent_research_id"),
+                delegate_strategy=submission_params.get("delegate_strategy"),
                 settings_snapshot=complete_settings,
             )
         except DuplicateResearchError:

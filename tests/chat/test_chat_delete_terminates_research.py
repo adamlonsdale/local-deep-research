@@ -24,6 +24,7 @@ on call args without needing a real worker thread.
 """
 
 import uuid
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from src.local_deep_research.chat.service import ChatService
@@ -31,7 +32,10 @@ from src.local_deep_research.constants import ResearchStatus
 from src.local_deep_research.database.models import (
     ChatSession,
     ChatSessionStatus,
+    QueuedResearch,
+    QueueStatus,
     ResearchHistory,
+    TaskMetadata,
 )
 
 
@@ -105,6 +109,9 @@ def test_delete_session_flags_in_progress_research_for_termination(
     # And the session row itself must be gone.
     with SessionLocal() as db:
         assert db.query(ChatSession).filter_by(id=session_id).first() is None
+        history = db.get(ResearchHistory, research_id)
+        assert history.status == ResearchStatus.SUSPENDED
+        assert history.chat_session_id is None
 
 
 def test_delete_session_skips_completed_research(setup_database_for_all_tests):
@@ -137,6 +144,119 @@ def test_delete_session_skips_completed_research(setup_database_for_all_tests):
     assert flagged == [], (
         f"Completed research must not be flagged for termination, got {flagged}"
     )
+
+
+def test_delete_session_cancels_recovered_queued_research(
+    setup_database_for_all_tests,
+):
+    """A restart-recovered turn must not dispatch after its chat is deleted."""
+    SessionLocal = setup_database_for_all_tests
+    username = f"alice_{uuid.uuid4().hex[:8]}"
+
+    with SessionLocal() as db:
+        session_id, research_id = _seed_session_and_research(
+            db, username, status=ResearchStatus.QUEUED.value
+        )
+        db.add(
+            QueuedResearch(
+                username=username,
+                research_id=research_id,
+                query="probe",
+                mode="quick",
+                settings_snapshot={},
+                position=1,
+                is_processing=False,
+            )
+        )
+        db.add(
+            TaskMetadata(
+                task_id=research_id,
+                task_type="research",
+                status=ResearchStatus.QUEUED,
+            )
+        )
+        db.add(QueueStatus(active_tasks=0, queued_tasks=1))
+        db.commit()
+
+    service = ChatService(username=username)
+    flagged = []
+    with (
+        patch(
+            "src.local_deep_research.chat.service.set_termination_flag",
+            side_effect=lambda rid: flagged.append(rid),
+        ),
+        patch(
+            "src.local_deep_research.chat.service.get_user_db_session"
+        ) as ctx,
+    ):
+        ctx.return_value.__enter__.return_value = SessionLocal()
+        ctx.return_value.__exit__.return_value = False
+        assert service.delete_session(session_id) is True
+
+    with SessionLocal() as db:
+        history = db.get(ResearchHistory, research_id)
+        task = db.get(TaskMetadata, research_id)
+        status = db.query(QueueStatus).one()
+        assert history.status == ResearchStatus.SUSPENDED
+        assert history.chat_session_id is None
+        assert db.query(QueuedResearch).count() == 0
+        assert task.status == ResearchStatus.SUSPENDED
+        assert status.queued_tasks == 0
+        assert status.active_tasks == 0
+    assert flagged == []
+
+
+def test_delete_attempt_removes_recovered_queue_tracking(
+    setup_database_for_all_tests,
+):
+    """Deleting a recovered attempt must not leave an orphan dispatcher row."""
+    SessionLocal = setup_database_for_all_tests
+    username = f"alice_{uuid.uuid4().hex[:8]}"
+
+    with SessionLocal() as db:
+        session_id, research_id = _seed_session_and_research(
+            db, username, status=ResearchStatus.QUEUED.value
+        )
+        db.add(
+            QueuedResearch(
+                username=username,
+                research_id=research_id,
+                query="probe",
+                mode="quick",
+                settings_snapshot={},
+                position=1,
+                is_processing=False,
+            )
+        )
+        db.add(
+            TaskMetadata(
+                task_id=research_id,
+                task_type="research",
+                status=ResearchStatus.QUEUED,
+            )
+        )
+        db.add(QueueStatus(active_tasks=0, queued_tasks=1))
+        db.commit()
+
+    @contextmanager
+    def session_context(_username):
+        with SessionLocal() as db:
+            yield db
+
+    service = ChatService(username=username)
+    with patch(
+        "src.local_deep_research.chat.service.get_user_db_session",
+        side_effect=session_context,
+    ):
+        assert service.delete_attempt(session_id, research_id) is True
+
+    with SessionLocal() as db:
+        assert db.get(ResearchHistory, research_id) is None
+        assert db.query(QueuedResearch).count() == 0
+        assert db.get(TaskMetadata, research_id) is None
+        status = db.query(QueueStatus).one()
+        assert status.queued_tasks == 0
+        assert status.active_tasks == 0
 
 
 def test_delete_session_returns_false_for_missing_session(

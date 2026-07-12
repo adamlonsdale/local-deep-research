@@ -305,7 +305,7 @@ def reclaim_stale_user_active_research(
     # this helper is only called from the route paths that already have
     # the ORM models in scope.
     from ...constants import ResearchStatus
-    from ...database.models import UserActiveResearch
+    from ...database.models import ResearchHistory, UserActiveResearch
 
     query = db_session.query(UserActiveResearch).filter(
         UserActiveResearch.username == username,
@@ -326,6 +326,16 @@ def reclaim_stale_user_active_research(
                 user=username,
             )
         row.status = ResearchStatus.FAILED
+        history = (
+            db_session.query(ResearchHistory)
+            .filter_by(id=row.research_id)
+            .first()
+        )
+        if history is not None and history.status == ResearchStatus.IN_PROGRESS:
+            # Keep the user-visible lifecycle in sync with the capacity row.
+            # Previously only UserActiveResearch changed, leaving History on
+            # an immortal "In Progress" spinner after a dead worker.
+            history.status = ResearchStatus.FAILED
         cleanup_research(row.research_id)
         reclaimed = True
     return reclaimed
