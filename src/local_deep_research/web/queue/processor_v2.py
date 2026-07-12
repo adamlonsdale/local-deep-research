@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from ...constants import ResearchStatus
 from ...database.encrypted_db import db_manager
 from ...database.models import (
+    AgentCheckpoint,
     ChatMessage,
     ChatProgressStep,
     ChatRole,
@@ -450,7 +451,11 @@ class QueueProcessorV2:
             current = []
         research.progress_log = [
             *current,
-            {"time": timestamp, "progress": 0, "message": message},
+            {
+                "time": timestamp,
+                "progress": research.progress or 0,
+                "message": message,
+            },
         ]
 
     @staticmethod
@@ -673,6 +678,28 @@ class QueueProcessorV2:
                         )
                         continue
 
+                    submission = payload["submission"]
+                    strategy = str(
+                        submission.get("strategy", "source-based")
+                    ).lower()
+                    can_continue_checkpoint = bool(
+                        research.mode == "quick"
+                        and strategy
+                        in {
+                            "langgraph-agent",
+                            "langgraph_agent",
+                            "mcp",
+                            "agentic",
+                        }
+                        and db_session.query(AgentCheckpoint)
+                        .filter_by(thread_id=research.id)
+                        .first()
+                        is not None
+                    )
+                    submission["resume_from_checkpoint"] = (
+                        can_continue_checkpoint
+                    )
+
                     # Durable compare-and-set claim. A second app worker that
                     # unlocks the same DB cannot also replay this research.
                     claimed = (
@@ -689,46 +716,55 @@ class QueueProcessorV2:
                     if not claimed:
                         continue
                     research.status = ResearchStatus.QUEUED
-                    research.progress = 0
                     research.completed_at = None
                     research.duration_seconds = None
-                    # Replay uses the same research_id. Remove attempt-local
-                    # output first: report storage overwrites the answer, while
-                    # source storage intentionally refuses to write if *any*
-                    # sources already exist, which would otherwise pair a new
-                    # answer with partial sources from the crashed attempt.
-                    research.report_content = None
-                    research.report_path = None
-                    db_session.query(ResearchResource).filter_by(
-                        research_id=research.id
-                    ).delete(synchronize_session=False)
-                    db_session.query(ChatProgressStep).filter_by(
-                        research_id=research.id
-                    ).delete(synchronize_session=False)
-                    removed_chat_messages = (
-                        db_session.query(ChatMessage)
-                        .filter(
-                            ChatMessage.research_id == research.id,
-                            ChatMessage.role == ChatRole.ASSISTANT,
-                        )
-                        .delete(synchronize_session=False)
-                    )
-                    if removed_chat_messages and research.chat_session_id:
-                        chat_session = db_session.get(
-                            ChatSession, research.chat_session_id
-                        )
-                        if chat_session is not None:
-                            chat_session.message_count = max(
-                                0,
-                                chat_session.message_count
-                                - removed_chat_messages,
+                    if not can_continue_checkpoint:
+                        research.progress = 0
+                        # Replay uses the same research_id. Remove
+                        # attempt-local output first: report storage
+                        # overwrites the answer, while source storage
+                        # intentionally refuses to write if any sources
+                        # already exist.
+                        research.report_content = None
+                        research.report_path = None
+                        db_session.query(ResearchResource).filter_by(
+                            research_id=research.id
+                        ).delete(synchronize_session=False)
+                        db_session.query(ChatProgressStep).filter_by(
+                            research_id=research.id
+                        ).delete(synchronize_session=False)
+                        removed_chat_messages = (
+                            db_session.query(ChatMessage)
+                            .filter(
+                                ChatMessage.research_id == research.id,
+                                ChatMessage.role == ChatRole.ASSISTANT,
                             )
-                    research.step_count = 0
+                            .delete(synchronize_session=False)
+                        )
+                        if (
+                            removed_chat_messages
+                            and research.chat_session_id
+                        ):
+                            chat_session = db_session.get(
+                                ChatSession, research.chat_session_id
+                            )
+                            if chat_session is not None:
+                                chat_session.message_count = max(
+                                    0,
+                                    chat_session.message_count
+                                    - removed_chat_messages,
+                                )
+                        research.step_count = 0
                     metadata.update(
                         {
                             "resume_count": resume_count + 1,
                             "resumed_at": now_iso,
                             "resume_reason": "application_restart",
+                            "resume_mode": (
+                                "checkpoint"
+                                if can_continue_checkpoint
+                                else "replay"
+                            ),
                         }
                     )
                     # Preserve the canonical launch envelope in history for a
@@ -739,7 +775,13 @@ class QueueProcessorV2:
                     self._append_recovery_log(
                         research,
                         now_iso,
-                        "Application restarted; resuming research from the beginning",
+                        (
+                            "Application restarted; continuing research from "
+                            "the latest saved checkpoint"
+                            if can_continue_checkpoint
+                            else "Application restarted; resuming research "
+                            "from the beginning"
+                        ),
                     )
 
                     queued = (
@@ -2019,6 +2061,9 @@ class QueueProcessorV2:
                 chat_message_id=submission_params.get("chat_message_id"),
                 parent_research_id=submission_params.get("parent_research_id"),
                 delegate_strategy=submission_params.get("delegate_strategy"),
+                resume_from_checkpoint=submission_params.get(
+                    "resume_from_checkpoint", False
+                ),
                 settings_snapshot=complete_settings,
             )
         except DuplicateResearchError:

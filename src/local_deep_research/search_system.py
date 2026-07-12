@@ -249,6 +249,16 @@ class AdvancedSearchSystem:
                 # Forwarded so strategies that create engines per tool call
                 # (e.g. langgraph-agent) can match the system's mode.
                 programmatic_mode=self.programmatic_mode,
+                research_id=self.research_id,
+                username=self.username,
+                resume_from_checkpoint=bool(
+                    self.research_context
+                    and self.research_context.get("resume_from_checkpoint")
+                ),
+                checkpoint_enabled=bool(
+                    self.research_context
+                    and self.research_context.get("research_mode") == "quick"
+                ),
             )
 
         # Log the actual strategy class

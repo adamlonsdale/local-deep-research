@@ -4,6 +4,11 @@ All models are organized by domain for better maintainability.
 """
 
 from .active_research import UserActiveResearch
+from .agent_checkpoint import (
+    AgentCheckpoint,
+    AgentCheckpointBlob,
+    AgentCheckpointWrite,
+)
 from .auth import User
 from .base import Base
 from .benchmark import (
@@ -104,6 +109,9 @@ __all__ = [
     "Base",
     # Active Research
     "UserActiveResearch",
+    "AgentCheckpoint",
+    "AgentCheckpointBlob",
+    "AgentCheckpointWrite",
     # Auth
     "User",
     # Queue

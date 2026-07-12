@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 from local_deep_research.constants import ResearchStatus
 from local_deep_research.database.models import (
+    AgentCheckpoint,
     Base,
     ChatMessage,
     ChatMessageType,
@@ -174,6 +175,85 @@ def test_recovery_uses_history_snapshot_when_active_row_was_never_committed():
     )
     assert queued.query == "query"
     assert queued.settings_snapshot["submission"]["strategy"] == "source-based"
+
+
+def test_langgraph_recovery_preserves_progress_sources_and_checkpoint():
+    db = _session()
+    old = datetime.now(UTC) - timedelta(hours=1)
+    envelope = _launch_envelope()
+    envelope["submission"]["strategy"] = "langgraph-agent"
+    db.add(
+        ResearchHistory(
+            id="agent-research",
+            query="query",
+            mode="quick",
+            status=ResearchStatus.IN_PROGRESS,
+            created_at=old.isoformat(),
+            progress=64,
+            progress_log=[{"time": old.isoformat(), "progress": 64}],
+            research_meta=envelope,
+        )
+    )
+    db.add(
+        ResearchResource(
+            research_id="agent-research",
+            title="durable source",
+            url="https://example.test/durable",
+            resource_metadata={
+                "original_data": {
+                    "title": "durable source",
+                    "link": "https://example.test/durable",
+                    "index": "1",
+                }
+            },
+            created_at=old.isoformat(),
+        )
+    )
+    db.add(
+        AgentCheckpoint(
+            thread_id="agent-research",
+            checkpoint_ns="",
+            checkpoint_id="checkpoint-1",
+            checkpoint_type="msgpack",
+            checkpoint_blob=b"checkpoint",
+            metadata_type="msgpack",
+            metadata_blob=b"metadata",
+            created_at=old,
+        )
+    )
+    db.commit()
+
+    processor = QueueProcessorV2(check_interval=1)
+    with patch(
+        "local_deep_research.web.routes.globals.is_research_thread_alive",
+        return_value=False,
+    ):
+        assert processor.recover_interrupted_researches(db, "alice") == 1
+
+    history = db.get(ResearchHistory, "agent-research")
+    queued = (
+        db.query(QueuedResearch)
+        .filter_by(research_id="agent-research")
+        .one()
+    )
+    assert history.progress == 64
+    assert history.research_meta["resume_mode"] == "checkpoint"
+    assert "latest saved checkpoint" in history.progress_log[-1]["message"]
+    assert queued.settings_snapshot["submission"][
+        "resume_from_checkpoint"
+    ] is True
+    assert (
+        db.query(ResearchResource)
+        .filter_by(research_id="agent-research")
+        .count()
+        == 1
+    )
+    assert (
+        db.query(AgentCheckpoint)
+        .filter_by(thread_id="agent-research")
+        .count()
+        == 1
+    )
 
 
 def test_recovery_restores_exact_persisted_chat_context():
