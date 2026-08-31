@@ -840,6 +840,36 @@ class TestStripSettingsSnapshotExtended:
         result = strip_settings_snapshot(meta)
         assert result == {"phase": "done"}
 
+    def test_restart_submission_hides_endpoint_context_and_nested_values(self):
+        """Only scalar, UI-safe launch fields may leave the encrypted DB."""
+        meta = {
+            "phase": "running",
+            "submission": {
+                "model_provider": "openai",
+                "model": "test-model",
+                "custom_endpoint": "http://user:secret@internal-llm:8000/v1",
+                "research_context": {
+                    "accumulated_findings": "private prior conversation"
+                },
+                "model_options": {"api_key": "sk-nested-secret"},
+            },
+            "settings_snapshot": {"api_key": "sk-top-level-secret"},
+        }
+
+        result = strip_settings_snapshot(meta)
+
+        assert result == {
+            "phase": "running",
+            "submission": {
+                "model_provider": "openai",
+                "model": "test-model",
+            },
+        }
+        serialized = json.dumps(result)
+        assert "internal-llm" not in serialized
+        assert "private prior conversation" not in serialized
+        assert "secret" not in serialized
+
 
 # ---------------------------------------------------------------------------
 # Security attack vectors -- ensuring no credential leakage paths

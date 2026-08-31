@@ -430,12 +430,35 @@ def filter_research_metadata(research_meta: Any) -> dict:
         return {"is_news_search": False}
 
 
-def strip_settings_snapshot(research_meta: Any) -> dict:
-    """Remove settings_snapshot from research_meta for API responses.
+_SAFE_RESEARCH_SUBMISSION_FIELDS = frozenset(
+    {
+        "model_provider",
+        "model",
+        "search_engine",
+        "max_results",
+        "time_period",
+        "iterations",
+        "questions_per_iteration",
+        "strategy",
+        "delegate_strategy",
+        "parent_research_id",
+        "question",
+        "chat_session_id",
+        "message_id",
+        "chat_message_id",
+        "research_mode",
+    }
+)
 
-    settings_snapshot contains all application settings including API keys.
-    This strips it while preserving all other metadata fields that the
-    frontend needs (phase, error_type, processed_query, mode, duration, etc.).
+
+def strip_settings_snapshot(research_meta: Any) -> dict:
+    """Remove private replay data from research metadata API responses.
+
+    ``settings_snapshot`` contains API keys and other application settings.
+    The persisted submission also contains restart-only fields such as an
+    internal custom endpoint and conversational context, so submission is
+    reduced to a scalar allowlist while ordinary metadata fields remain
+    available to the frontend.
 
     Args:
         research_meta: Raw research metadata (dict, JSON string, or None)
@@ -449,6 +472,21 @@ def strip_settings_snapshot(research_meta: Any) -> dict:
             meta = json.loads(meta)
         if not isinstance(meta, dict):
             return {}
-        return {k: v for k, v in meta.items() if k != "settings_snapshot"}
+        safe_meta = {
+            key: value
+            for key, value in meta.items()
+            if key != "settings_snapshot"
+        }
+        submission = safe_meta.get("submission")
+        if isinstance(submission, dict):
+            safe_meta["submission"] = {
+                key: value
+                for key, value in submission.items()
+                if key in _SAFE_RESEARCH_SUBMISSION_FIELDS
+                and (
+                    value is None or isinstance(value, (str, int, float, bool))
+                )
+            }
+        return safe_meta
     except (json.JSONDecodeError, TypeError, AttributeError):
         return {}

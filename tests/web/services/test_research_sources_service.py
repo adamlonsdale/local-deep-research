@@ -91,6 +91,32 @@ class TestSaveResearchSources:
             assert result == 5
             mock_session.add.assert_not_called()
 
+    def test_append_persists_checkpoint_batch_when_sources_exist(self):
+        """Agent checkpoint batches append instead of triggering final-save guard."""
+        from local_deep_research.web.services.research_sources_service import (
+            ResearchSourcesService,
+        )
+
+        with patch(
+            "local_deep_research.web.services.research_sources_service.get_user_db_session"
+        ) as mock_get_session:
+            mock_session = MagicMock()
+            mock_session.__enter__ = Mock(return_value=mock_session)
+            mock_session.__exit__ = Mock(return_value=False)
+            mock_session.query.return_value.filter_by.return_value.count.return_value = 5
+            mock_get_session.return_value = mock_session
+
+            result = ResearchSourcesService.save_research_sources(
+                "test-id",
+                [{"url": "https://example.com/new", "index": "6"}],
+                username="testuser",
+                append=True,
+            )
+
+            assert result == 1
+            mock_session.add.assert_called_once()
+            mock_session.commit.assert_called_once()
+
     def test_save_research_sources_skips_no_url(self):
         """Test skipping sources without URL."""
         from local_deep_research.web.services.research_sources_service import (

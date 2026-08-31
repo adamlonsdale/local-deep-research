@@ -526,10 +526,13 @@ def apply_middleware(app):
     app.before_request(ensure_user_database)
     # Then inject current user into g
     app.before_request(inject_current_user)
+    # Recover interrupted workers and process pending queue operations before
+    # cleanup. After a container restart the in-memory active registry is
+    # empty, and cleanup must not discard the persisted launch snapshot before
+    # recovery has had a chance to use it.
+    app.before_request(process_pending_queue_operations)
     # Clean up completed research records
     app.before_request(cleanup_completed_research)
-    # Process any pending queue operations for this user (direct mode)
-    app.before_request(process_pending_queue_operations)
     # Notify queue processor of user activity (queue mode)
     app.before_request(notify_queue_processor)
 

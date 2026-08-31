@@ -380,6 +380,12 @@ def create_strategy(
             programmatic_mode=kwargs.get("programmatic_mode", False),
             all_links_of_system=all_links_of_system,
             settings_snapshot=settings_snapshot,
+            research_id=kwargs.get("research_id"),
+            username=kwargs.get("username"),
+            resume_from_checkpoint=kwargs.get(
+                "resume_from_checkpoint", False
+            ),
+            checkpoint_enabled=kwargs.get("checkpoint_enabled", False),
         )
 
     # Default to source-based if unknown

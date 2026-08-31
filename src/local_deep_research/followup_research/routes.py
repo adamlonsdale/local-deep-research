@@ -324,14 +324,40 @@ def start_followup():
 
         created_at = datetime.now(UTC).isoformat()
 
+        # Resolve and persist the exact worker envelope before the history row
+        # is committed. Contextual follow-ups cannot be faithfully recreated
+        # from only a parent ID and question after a container restart.
+        model_provider = settings_snapshot.get("llm.provider", {}).get(
+            "value", "ollama"
+        )
+        model_provider = normalize_provider(model_provider)
+        model = settings_snapshot.get("llm.model", {}).get("value", "")
+        search_engine = settings_snapshot.get("search.tool", {}).get(
+            "value", "searxng"
+        )
+        launch_submission = {
+            "parent_research_id": research_params["parent_research_id"],
+            "question": data.get("question"),
+            "model_provider": model_provider,
+            "model": model,
+            "search_engine": search_engine,
+            "custom_endpoint": custom_endpoint,
+            "strategy": "enhanced-contextual-followup",
+            "iterations": research_params["max_iterations"],
+            "questions_per_iteration": research_params[
+                "questions_per_iteration"
+            ],
+            "delegate_strategy": research_params.get(
+                "delegate_strategy", "source-based"
+            ),
+            "research_context": research_params["research_context"],
+        }
+
         with get_user_db_session(username) as db_session:
             # Create the database entry (required for tracking)
             research_meta = {
-                "submission": {
-                    "parent_research_id": data.get("parent_research_id"),
-                    "question": data.get("question"),
-                    "strategy": "contextual-followup",
-                },
+                "submission": launch_submission,
+                "settings_snapshot": settings_snapshot,
             }
 
             research = ResearchHistory(
@@ -406,17 +432,6 @@ def start_followup():
             f"Starting follow-up research for query of type: {type(research_params.get('query'))}"
         )
 
-        # Get model and search settings from user's settings
-        model_provider = settings_snapshot.get("llm.provider", {}).get(
-            "value", "ollama"
-        )
-        # Normalize provider to lowercase canonical form
-        model_provider = normalize_provider(model_provider)
-        model = settings_snapshot.get("llm.model", {}).get("value", "")
-        search_engine = settings_snapshot.get("search.tool", {}).get(
-            "value", "searxng"
-        )
-
         # Spawn the research thread. If the spawn fails, the
         # ResearchHistory row committed above would otherwise be
         # permanently orphaned with status=IN_PROGRESS. Catch any
@@ -435,18 +450,14 @@ def start_followup():
                 model=model,  # Pass model name
                 search_engine=search_engine,  # Pass search engine
                 custom_endpoint=custom_endpoint,  # Pass custom endpoint if any
-                strategy="enhanced-contextual-followup",  # Use enhanced contextual follow-up strategy
-                iterations=research_params["max_iterations"],
-                questions_per_iteration=research_params[
+                strategy=launch_submission["strategy"],
+                iterations=launch_submission["iterations"],
+                questions_per_iteration=launch_submission[
                     "questions_per_iteration"
                 ],
-                delegate_strategy=research_params.get(
-                    "delegate_strategy", "source-based"
-                ),
-                research_context=research_params["research_context"],
-                parent_research_id=research_params[
-                    "parent_research_id"
-                ],  # Pass parent research ID
+                delegate_strategy=launch_submission["delegate_strategy"],
+                research_context=launch_submission["research_context"],
+                parent_research_id=launch_submission["parent_research_id"],
                 settings_snapshot=settings_snapshot,
             )
         except DuplicateResearchError:

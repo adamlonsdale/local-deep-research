@@ -277,6 +277,26 @@ def _spawn_chat_research(
 
     research_id = str(uuid.uuid4())
 
+    model_provider = settings_snapshot.get("llm.provider", {}).get("value", "")
+    model = settings_snapshot.get("llm.model", {}).get("value", "")
+    search_engine = settings_snapshot.get("search.tool", {}).get("value", "")
+    custom_endpoint = settings_snapshot.get("llm.openai_endpoint.url", {}).get(
+        "value"
+    )
+    user_strategy = settings_snapshot.get("search.search_strategy", {}).get(
+        "value", "langgraph-agent"
+    )
+
+    # Persist the exact contextual envelope before spawning. A container can
+    # disappear immediately after the transaction below commits, and chat
+    # follow-ups cannot be reconstructed faithfully from their IDs alone.
+    research_context = dict(research_context)
+    if research_context.get("is_multi_turn"):
+        strategy = "enhanced-contextual-followup"
+        research_context["delegate_strategy"] = user_strategy
+    else:
+        strategy = user_strategy
+
     # ---- Atomic write: user message + research row in ONE transaction ----
     # Closes the orphan window: any IntegrityError or concurrent-delete on
     # the research insert rolls back the user message too. The
@@ -299,8 +319,18 @@ def _spawn_chat_research(
                 "submission": {
                     "chat_session_id": session_id,
                     "message_id": message_id,
+                    "chat_message_id": message_id,
                     "research_mode": research_mode,
+                    "model_provider": model_provider,
+                    "model": model,
+                    "search_engine": search_engine,
+                    "custom_endpoint": custom_endpoint,
+                    "strategy": strategy,
+                    "iterations": iterations,
+                    "questions_per_iteration": questions,
+                    "research_context": research_context,
                 },
+                "settings_snapshot": settings_snapshot,
             }
             research = ResearchHistory(
                 id=research_id,
@@ -357,24 +387,6 @@ def _spawn_chat_research(
 
     # Get user password for metrics writes inside the worker thread.
     pw = get_user_password(username)
-
-    model_provider = settings_snapshot.get("llm.provider", {}).get("value", "")
-    model = settings_snapshot.get("llm.model", {}).get("value", "")
-    search_engine = settings_snapshot.get("search.tool", {}).get("value", "")
-    custom_endpoint = settings_snapshot.get("llm.openai_endpoint.url", {}).get(
-        "value"
-    )
-    user_strategy = settings_snapshot.get("search.search_strategy", {}).get(
-        "value", "langgraph-agent"
-    )
-
-    # For follow-up messages, use the contextual follow-up strategy
-    # which wraps the user's preferred strategy as a delegate.
-    if research_context.get("is_multi_turn"):
-        strategy = "enhanced-contextual-followup"
-        research_context["delegate_strategy"] = user_strategy
-    else:
-        strategy = user_strategy
 
     # Spawn the worker thread. ``DuplicateResearchError`` and
     # ``SystemAtCapacityError`` inherit from ``Exception`` (not
@@ -476,16 +488,20 @@ def _enforce_chat_session_research_slot(
     first via ``reclaim_stale_user_active_research`` so the count check
     sees accurate numbers.
     """
-    # Per-session guard. Note: this fires for ANY in-progress research
-    # on the session, INCLUDING the target research on a retry path.
+    # Per-session guard. A recovered turn is QUEUED briefly before its
+    # replacement worker starts, and must occupy the chat during that window
+    # too or a newer turn can overtake it. This also fires for the target
+    # research on a retry path.
     # Retry routes must therefore ensure the target is not in-progress
     # (typically via delete_attempt's AttemptInProgress semantics)
     # BEFORE calling this.
     existing_session_research = (
         cap_db.query(ResearchHistory)
-        .filter_by(
-            chat_session_id=session_id,
-            status=ResearchStatus.IN_PROGRESS,
+        .filter(
+            ResearchHistory.chat_session_id == session_id,
+            ResearchHistory.status.in_(
+                [ResearchStatus.IN_PROGRESS, ResearchStatus.QUEUED]
+            ),
         )
         .first()
     )
@@ -1260,9 +1276,14 @@ def send_message(session_id):
                 # 2. Per-session guard: at most one live research per chat.
                 existing_session_research = (
                     cap_db.query(ResearchHistory)
-                    .filter_by(
-                        chat_session_id=session_id,
-                        status=ResearchStatus.IN_PROGRESS,
+                    .filter(
+                        ResearchHistory.chat_session_id == session_id,
+                        ResearchHistory.status.in_(
+                            [
+                                ResearchStatus.IN_PROGRESS,
+                                ResearchStatus.QUEUED,
+                            ]
+                        ),
                     )
                     .first()
                 )

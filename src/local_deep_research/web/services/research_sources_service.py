@@ -402,6 +402,7 @@ class ResearchSourcesService:
         research_id: str,
         sources: List[Dict[str, Any]],
         username: Optional[str] = None,
+        append: bool = False,
     ) -> int:
         """
         Save sources from research to the ResearchResource table.
@@ -410,6 +411,9 @@ class ResearchSourcesService:
             research_id: The UUID of the research
             sources: List of source dictionaries with url, title, snippet, etc.
             username: Username for database access
+            append: Persist this batch even when earlier source batches exist.
+                Used by durable agent checkpoints so every completed tool call
+                has matching source data before its graph state is advanced.
 
         Returns:
             Number of sources saved
@@ -435,7 +439,7 @@ class ResearchSourcesService:
                     .count()
                 )
 
-                if existing > 0:
+                if existing > 0 and not append:
                     logger.info(
                         f"Research {research_id} already has {existing} resources, skipping save"
                     )
@@ -763,18 +767,31 @@ class ResearchSourcesService:
                 )
 
                 for resource in resources:
-                    sources.append(
-                        {
-                            "id": resource.id,
+                    resource_metadata = resource.resource_metadata or {}
+                    original = resource_metadata.get("original_data")
+                    if isinstance(original, dict):
+                        source = dict(original)
+                        source.setdefault("url", resource.url)
+                        source.setdefault("link", resource.url)
+                        source.setdefault("title", resource.title)
+                        source.setdefault("snippet", resource.content_preview)
+                        source.setdefault("source_type", resource.source_type)
+                    else:
+                        source = {
                             "url": resource.url,
+                            "link": resource.url,
                             "title": resource.title,
                             "snippet": resource.content_preview,
-                            "content_preview": resource.content_preview,
                             "source_type": resource.source_type,
-                            "metadata": resource.resource_metadata or {},
-                            "created_at": resource.created_at,
                         }
+                    source["resource_id"] = resource.id
+                    source["id"] = resource.id
+                    source.setdefault(
+                        "content_preview", resource.content_preview
                     )
+                    source["metadata"] = resource_metadata
+                    source["created_at"] = resource.created_at
+                    sources.append(source)
 
                 logger.info(
                     f"Retrieved {len(sources)} sources for research {research_id}"

@@ -2,10 +2,11 @@
 Middleware to process pending queue operations when user has active session.
 """
 
-from flask import g
+from flask import g, session
 from loguru import logger
 
 from ...database.encrypted_db import db_manager
+from ...database.models import QueuedResearch
 from ...database.session_context import get_user_db_session
 
 # Keep the singleton import lazy so disabled pytest app startup does not
@@ -46,6 +47,34 @@ def process_pending_queue_operations():
                     f"get_user_db_session returned None for {username} during queue processing"
                 )
                 return
+
+            # On the first authenticated request after a process/container
+            # restart, repair database rows whose worker thread disappeared.
+            # This hook runs for GETs (including the post-login page load),
+            # unlike queue_middleware_v2 which intentionally skips GETs.
+            recovered_count = queue_processor.recover_interrupted_researches(
+                db_session, username
+            )
+
+            queued_count = (
+                db_session.query(QueuedResearch)
+                .filter_by(username=username)
+                .count()
+            )
+            has_recovered_work = (
+                isinstance(recovered_count, int) and recovered_count > 0
+            )
+            has_queued_work = isinstance(queued_count, int) and queued_count > 0
+            if has_recovered_work or has_queued_work:
+                session_id = session.get("session_id")
+                if session_id:
+                    queue_processor.notify_user_activity(username, session_id)
+
+            if has_recovered_work:
+                logger.info(
+                    f"Recovered {recovered_count} interrupted researches "
+                    f"for {username}"
+                )
 
             # Process any pending operations for this user
             started_count = processor.process_pending_operations_for_user(

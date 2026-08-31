@@ -360,7 +360,11 @@ class SearchResultsCollector:
         map 1:1.
     """
 
-    def __init__(self, all_links: list | None = None) -> None:
+    def __init__(
+        self,
+        all_links: list | None = None,
+        on_results=None,
+    ) -> None:
         self._results: list[dict] = []
         self._sources: list[str] = []
         # Canonical keys already present in ``_sources`` for the current
@@ -444,6 +448,7 @@ class SearchResultsCollector:
                 except (ValueError, TypeError):
                     pass
         self._max_idx = max_seeded_idx
+        self._on_results = on_results
 
     # -- public API ----------------------------------------------------------
 
@@ -645,6 +650,13 @@ class SearchResultsCollector:
                     self._sources_seen.add(key)
                 self._results.append(r)
                 indexed.append(r)
+
+            # Persist before returning so a completed tool result is never
+            # checkpointed while its citation sources exist only in RAM;
+            # otherwise a restart would restore agent messages with dangling
+            # citation indices.
+            if indexed and self._on_results is not None:
+                self._on_results(indexed)
             return start_idx, indexed
 
     def _reuse_index(self, key: str, snippet_key: str) -> str | None:
@@ -1032,12 +1044,23 @@ class SearchResultsCollector:
                         continue
         return None
 
-    def reset(self) -> None:
+    def reset(self, preserve_existing: bool = False) -> None:
         """Clear per-call state.  ``_all_links`` is intentionally kept."""
         with self._lock:
-            self._results.clear()
-            self._sources.clear()
-            self._sources_seen.clear()
+            if preserve_existing:
+                self._results = list(self._all_links)
+                self._sources = [
+                    result.get("link", result.get("url", ""))
+                    for result in self._all_links
+                    if result.get("link", result.get("url", ""))
+                ]
+                self._sources_seen = {
+                    _citation_dedup_key(s) for s in self._sources if s
+                }
+            else:
+                self._results.clear()
+                self._sources.clear()
+                self._sources_seen.clear()
 
     @property
     def results(self) -> list[dict]:
@@ -1904,6 +1927,10 @@ class LangGraphAgentStrategy(BaseSearchStrategy):
         all_links_of_system: list | None = None,
         settings_snapshot: dict | None = None,
         programmatic_mode: bool = False,
+        research_id: str | None = None,
+        username: str | None = None,
+        resume_from_checkpoint: bool = False,
+        checkpoint_enabled: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -1917,6 +1944,10 @@ class LangGraphAgentStrategy(BaseSearchStrategy):
         # mode (no DB metrics/rate-limit persistence). Threaded into the
         # tool factory closures so engines created per tool call inherit it.
         self.programmatic_mode = programmatic_mode
+        self.research_id = research_id
+        self.username = username
+        self.resume_from_checkpoint = bool(resume_from_checkpoint)
+        self.checkpoint_saver = None
         # search.iterations (typically 1-5) controls pipeline strategies.
         # For an agent, each "iteration" is one LLM→tool round-trip, so we
         # need many more.  Treat any value below the agent minimum as "use
@@ -1933,7 +1964,50 @@ class LangGraphAgentStrategy(BaseSearchStrategy):
             handler_type="standard",
             settings_snapshot=settings_snapshot,
         )
-        self.collector = SearchResultsCollector(self.all_links_of_system)
+        persist_callback = None
+        if (
+            checkpoint_enabled
+            and not self.programmatic_mode
+            and self.research_id
+            and self.username
+        ):
+            from ...database.agent_checkpoint_saver import (
+                EncryptedAgentCheckpointSaver,
+            )
+
+            self.checkpoint_saver = EncryptedAgentCheckpointSaver(
+                self.username
+            )
+            if self.resume_from_checkpoint:
+                from ...web.services.research_sources_service import (
+                    ResearchSourcesService,
+                )
+
+                restored = ResearchSourcesService.get_research_sources(
+                    self.research_id, self.username
+                )
+                self.all_links_of_system.extend(restored)
+                logger.info(
+                    f"Restored {len(restored)} durable sources for agent "
+                    f"research {self.research_id}"
+                )
+
+            def persist_callback(results):
+                from ...web.services.research_sources_service import (
+                    ResearchSourcesService,
+                )
+
+                ResearchSourcesService.save_research_sources(
+                    research_id=self.research_id,
+                    sources=results,
+                    username=self.username,
+                    append=True,
+                )
+
+        self.collector = SearchResultsCollector(
+            self.all_links_of_system,
+            on_results=persist_callback,
+        )
         self._collection_tool_display_names: dict[str, str] = {}
         self._collection_tool_display_names_loaded = False
 
@@ -2541,8 +2615,12 @@ class LangGraphAgentStrategy(BaseSearchStrategy):
         logger.info(f"LangGraph agent research: {query[:100]}")
 
         # Reset collector for fresh subsection call (detailed report mode)
-        self.collector.reset()
-        nr_of_links = len(self.all_links_of_system)
+        self.collector.reset(preserve_existing=self.resume_from_checkpoint)
+        nr_of_links = (
+            0
+            if self.resume_from_checkpoint
+            else len(self.all_links_of_system)
+        )
 
         self._update_progress(
             f'Starting agent research: "{query[:80]}"',
@@ -2655,11 +2733,14 @@ class LangGraphAgentStrategy(BaseSearchStrategy):
         # via __getattr__ unstripped; `|` raises TypeError, no __or__), but none
         # are on this create_agent path — see config/llm_config.py.
         try:
-            agent = create_agent(
-                model=self.model,
-                tools=tools,
-                system_prompt=system_prompt,
-            )
+            agent_kwargs = {
+                "model": self.model,
+                "tools": tools,
+                "system_prompt": system_prompt,
+            }
+            if self.checkpoint_saver is not None:
+                agent_kwargs["checkpointer"] = self.checkpoint_saver
+            agent = create_agent(**agent_kwargs)
         except Exception as exc:
             logger.exception("Failed to create LangGraph agent")
             return self._error_result(
@@ -2672,13 +2753,17 @@ class LangGraphAgentStrategy(BaseSearchStrategy):
         # Stream agent execution
         effective_max = max(MIN_ITERATIONS, self.max_iterations)
         config = {"recursion_limit": effective_max * 2 + 1}
+        if self.checkpoint_saver is not None:
+            config["configurable"] = {"thread_id": self.research_id}
         iteration = 0
         final_content = ""
         agent_messages: list = []
 
+        stream_input = {"messages": [{"role": "user", "content": query}]}
+
         try:
             for chunk in agent.stream(
-                {"messages": [{"role": "user", "content": query}]},
+                stream_input,
                 config,
                 stream_mode="updates",
             ):

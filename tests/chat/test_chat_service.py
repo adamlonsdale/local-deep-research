@@ -879,9 +879,8 @@ class TestChatServiceGetInProgressResearchId:
 
     The client (chat.js ``loadSession``) reads this value to restore the
     "thinking" indicator on reload. The method queries ResearchHistory
-    via the partial-unique index
-    ``ux_research_history_chat_session_in_progress`` (migration 0010) so
-    at most one row can match.
+    for both IN_PROGRESS workers and restart-recovered QUEUED work so reloads
+    do not briefly re-enable the composer before dispatch.
     """
 
     def test_returns_none_when_no_in_progress_research(
@@ -929,12 +928,10 @@ class TestChatServiceGetInProgressResearchId:
         with pytest.raises(OperationalError):
             service.get_in_progress_research_id("session-123")
 
-    def test_query_filters_by_in_progress_status_and_session_id(
+    def test_query_filters_by_active_statuses_and_session_id(
         self, mock_user_db_session
     ):
-        """Locks the query shape against accidental regressions — the
-        partial-unique-index lookup depends on the predicate matching
-        the index's WHERE clause exactly."""
+        """Locks the query shape against dropping restart-queued work."""
         from local_deep_research.chat.service import ChatService
         from local_deep_research.constants import ResearchStatus
         from local_deep_research.database.models import ResearchHistory
@@ -948,19 +945,16 @@ class TestChatServiceGetInProgressResearchId:
 
         # Selected ResearchHistory.id (not the whole row)
         mock_user_db_session.query.assert_called_once_with(ResearchHistory.id)
-        # Filter call received both clauses; we don't assert SQL text
-        # equality (SQLAlchemy ClauseElements compare by identity), only
-        # that two clauses were passed and IN_PROGRESS is referenced.
+        # Filter call received session scope plus the two active statuses.
         filter_args = query_mock.filter.call_args[0]
         assert len(filter_args) == 2
-        # Verify the actual bound values rather than just that the enum exists
-        # (the previous `is not None` assertion was a tautology). Each clause is
-        # a BinaryExpression whose .right is a BindParameter carrying the
-        # compared value; this catches a regression that swaps IN_PROGRESS for
-        # another status or drops the session-id predicate.
         bind_values = [
             getattr(getattr(c, "right", None), "value", None)
             for c in filter_args
         ]
-        assert ResearchStatus.IN_PROGRESS in bind_values
+        assert "session-xyz" in bind_values
+        assert [
+            ResearchStatus.IN_PROGRESS,
+            ResearchStatus.QUEUED,
+        ] in bind_values
         assert "session-xyz" in bind_values

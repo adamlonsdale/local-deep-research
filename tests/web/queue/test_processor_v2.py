@@ -99,6 +99,29 @@ class TestQueueProcessorV2StartStop:
             processor.running = False
             processor.thread.join(timeout=1)
 
+    def test_start_runs_queue_loop_inside_supplied_app_context(self):
+        """Queued workers inherit an app context from the processor loop."""
+        from flask import Flask, current_app
+
+        from local_deep_research.web.queue.processor_v2 import (
+            QueueProcessorV2,
+        )
+
+        app = Flask(__name__)
+        processor = QueueProcessorV2()
+        observed_app_names = []
+
+        def observe_context():
+            observed_app_names.append(current_app.name)
+
+        with patch.object(
+            processor, "_process_queue_loop", side_effect=observe_context
+        ):
+            processor.start(app)
+            processor.thread.join(timeout=1)
+
+        assert observed_app_names == [app.name]
+
     def test_start_when_already_running(self):
         """start does nothing if already running."""
         from local_deep_research.web.queue.processor_v2 import (

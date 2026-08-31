@@ -199,6 +199,44 @@ class TestCleanupCompletedResearch:
                 mock_db_session.delete.assert_not_called()
                 mock_db_session.commit.assert_not_called()
 
+    def test_preserves_in_progress_row_for_restart_recovery(self):
+        """An empty process registry after restart must not erase launch data."""
+        app = Flask(__name__)
+        app.secret_key = "test"
+
+        mock_db_session = MagicMock()
+        mock_record = MagicMock(research_id="interrupted-research")
+        active_query = MagicMock()
+        active_query.filter_by.return_value.limit.return_value.all.return_value = [
+            mock_record
+        ]
+        history_query = MagicMock()
+        history_query.filter_by.return_value.scalar.return_value = "in_progress"
+        mock_db_session.query.side_effect = [active_query, history_query]
+
+        with (
+            patch(
+                "local_deep_research.web.auth.cleanup_middleware.should_skip_database_middleware",
+                return_value=False,
+            ),
+            patch(
+                "local_deep_research.web.routes.globals.is_research_active",
+                return_value=False,
+            ),
+        ):
+            from flask import g, session
+            from local_deep_research.web.auth.cleanup_middleware import (
+                cleanup_completed_research,
+            )
+
+            with app.test_request_context("/"):
+                session["username"] = "testuser"
+                g.db_session = mock_db_session
+                cleanup_completed_research()
+
+        mock_db_session.delete.assert_not_called()
+        mock_db_session.commit.assert_not_called()
+
     def test_handles_operational_error(self):
         """Should handle OperationalError gracefully."""
         from sqlalchemy.exc import OperationalError

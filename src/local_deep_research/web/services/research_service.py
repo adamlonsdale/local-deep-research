@@ -1112,6 +1112,9 @@ def run_research_process(research_id, query, mode, **kwargs):
             # threads (engine config, per-user resolution, egress scope).
             "settings_snapshot": settings_snapshot,
             "chat_session_id": kwargs.get("chat_session_id"),
+            "resume_from_checkpoint": bool(
+                kwargs.get("resume_from_checkpoint", False)
+            ),
         }
 
         # If this is a follow-up research, include the parent context
@@ -2938,6 +2941,7 @@ def run_research_process(research_id, query, mode, **kwargs):
                         role="assistant",
                         content=f"Sorry, the research failed: {message}",
                         message_type="response",
+                        research_id=research_id,
                         allow_archived=True,
                     )
                 except Exception:
@@ -3057,6 +3061,21 @@ def cleanup_research_resources(
         logger.warning(
             f"Cannot notify completion for research {research_id} - no username provided"
         )
+
+    # A terminal research must not leave agent messages/tool outputs behind.
+    # Process crashes never reach this cleanup path, which is precisely what
+    # preserves the checkpoint for automatic continuation after restart.
+    if username:
+        try:
+            from ...database.agent_checkpoint_saver import (
+                delete_research_checkpoints,
+            )
+
+            delete_research_checkpoints(username, research_id)
+        except Exception:
+            logger.opt(exception=True).warning(
+                f"Failed to delete terminal agent checkpoint for {research_id}"
+            )
 
     # Remove from active research and termination flags atomically
     cleanup_research(research_id)
