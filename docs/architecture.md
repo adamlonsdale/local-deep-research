@@ -202,6 +202,7 @@ mindmap
         Anthropic
         Google
         OpenRouter
+        Requesty
     Output
       Markdown
       PDF
@@ -228,6 +229,7 @@ mindmap
 | Anthropic | Cloud | Claude 3 family |
 | Google | Cloud | Gemini models |
 | OpenRouter | Cloud | 100+ models via single API |
+| Requesty | Cloud | 100+ models via single API |
 
 ### Search Engines
 
@@ -374,7 +376,7 @@ The codebase follows a consistent pattern for extensibility:
 New search engines can be added by:
 1. Creating a class inheriting from `BaseSearchEngine`
 2. Placing it in `web_search_engines/engines/`
-3. Auto-discovery handles registration
+3. Register the engine in `ENGINE_REGISTRY` and add it to the security module allowlist in `security/module_whitelist.py`
 
 ```python
 # Example: Adding a new search engine
@@ -386,13 +388,14 @@ class SearchEngineCustom(BaseSearchEngine):
 
 #### LLM Provider Integration
 
-Supports 9 LLM providers with auto-discovery:
+Supports 10 LLM providers with auto-discovery:
 - Ollama (local)
 - LM Studio (local)
 - OpenAI
 - Anthropic
 - Google Gemini
 - OpenRouter (100+ models)
+- Requesty (100+ models)
 - DeepSeek
 - Mistral
 - Groq
@@ -565,7 +568,7 @@ While the project scores highly overall, these areas have room for growth:
 | Search Engines | `src/local_deep_research/web_search_engines/engines/` | 25 search engine implementations |
 | Report Generation | `src/local_deep_research/report_generator.py` | `IntegratedReportGenerator` |
 | Web API | `src/local_deep_research/web/routes/` | Flask routes and WebSocket handlers |
-| Database | `src/local_deep_research/web/database/` | SQLCipher models and migrations |
+| Database | `src/local_deep_research/database/` | SQLCipher models and migrations |
 | Encrypted DB | `src/local_deep_research/database/encrypted_db.py` | Per-user SQLCipher engine lifecycle |
 | Thread Sessions | `src/local_deep_research/database/thread_local_session.py` | Thread-safe session management and cleanup |
 | Settings | `src/local_deep_research/config/` | Configuration and LLM setup |

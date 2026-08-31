@@ -9,6 +9,12 @@ the key exists; direct access fails fast if the decorator is ever removed.
 import inspect
 import textwrap
 
+import pytest
+
+# Static source-analysis suite (never runs login_required), but opt out of the
+# legacy-auth shim anyway so it can never mask the real session-id check.
+pytestmark = pytest.mark.real_session_check
+
 
 def _get_function_source(func):
     """Get dedented source of a function for AST analysis."""
@@ -233,7 +239,6 @@ class TestLibraryRoutesSessionAccess:
     def _get_route_functions(self):
         from local_deep_research.research_library.routes.library_routes import (
             check_downloads,
-            delete_document,
             document_details_page,
             download_all_text,
             download_bulk,
@@ -265,7 +270,6 @@ class TestLibraryRoutesSessionAccess:
             get_collections_list,
             get_documents,
             toggle_favorite,
-            delete_document,
             view_pdf_page,
             view_text_page,
             serve_text_api,
