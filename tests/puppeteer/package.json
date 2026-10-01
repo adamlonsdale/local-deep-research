@@ -17,7 +17,7 @@
     "test:debug": "HEADLESS=false mocha test_*.js --timeout 300000 --inspect-brk"
   },
   "dependencies": {
-    "chai": "^6.2.2",
+    "chai": "^6.3.0",
     "mocha": "^11.8.0",
     "puppeteer": "25.8.0"
   },
@@ -34,6 +34,6 @@
     "js-yaml": "^4.2.0"
   },
   "devDependencies": {
-    "eslint": "^10.9.1"
+    "eslint": "^10.11.0"
   }
 }
